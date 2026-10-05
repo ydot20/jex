@@ -94,6 +94,11 @@ python -m jex.server --checkpoint artifacts/lora
 GPU-прогон крупнее: [`notebooks/jex_gpu.ipynb`](notebooks/jex_gpu.ipynb) (Colab/Kaggle; или через colab-mcp, см.
 [`docs/COLAB_MCP.md`](docs/COLAB_MCP.md)).
 
+Для полного **настроенного** прогона с фиксацией версий, журналами, проверкой ошибок и покрытием бенчмарка
+есть [`notebooks/jex_gpu_full.ipynb`](notebooks/jex_gpu_full.ipynb) и
+[`инструкция`](docs/COLAB_FULL_RUN.md). Он клонирует публичный репозиторий без токена и сохраняет исходные
+размеры экспериментов; лимит бенчмарка 30 примеров на датасет не означает полный eval-сплит.
+
 ## Устройство
 
 | файл | что делает |
