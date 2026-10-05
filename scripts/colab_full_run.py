@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from importlib import metadata as package_metadata, util as import_util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import sqlite3
@@ -96,18 +98,38 @@ def sha256(path):
     return h.hexdigest()
 
 
+def installed_version(name):
+    try:
+        return package_metadata.version(name)
+    except package_metadata.PackageNotFoundError:
+        return None
+
+
+def torchao_is_incompatible(version):
+    """Conservatively classify stable release metadata against PEFT 0.21.2.
+
+    Prerelease or unrecognized versions are not grounds for automatic removal.
+    No ML package needs to be imported for this check.
+    """
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?(?:\+[A-Za-z0-9.-]+)?", version)
+    if match is None:
+        return None
+    return tuple(int(value or 0) for value in match.groups()) < (0, 16, 0)
+
+
 class Blocked(RuntimeError):
     pass
 
 
 class Runner:
-    def __init__(self, root, *, jev_license_ack=False):
+    def __init__(self, root, *, jev_license_ack=False, allow_colab_optional_package_cleanup=False):
         self.root = Path(root).resolve()
         self.repo = self.root / "jex"
         self.harness = self.root / "jev-benchmarking"
         self.logs = self.root / "logs"
         self.logs.mkdir(parents=True, exist_ok=True)
         self.jev_license_ack = jev_license_ack
+        self.allow_colab_optional_package_cleanup = allow_colab_optional_package_cleanup
         self.status_path = self.root / "stage_status.json"
         self.status = json.loads(self.status_path.read_text()) if self.status_path.exists() else {}
         config_path = self.root / "run_config.json"
@@ -230,11 +252,71 @@ class Runner:
                 self.bundle()
         self.emit(f"{row['status'].upper()} {name} ({row['seconds']:.1f}s)")
 
+    def colab_runtime_evidence(self):
+        try:
+            has_colab_package = import_util.find_spec("google.colab") is not None
+        except (ImportError, ValueError):
+            has_colab_package = False
+        return {
+            "colab_package_available": has_colab_package,
+            "colab_release_tag_present": bool(os.environ.get("COLAB_RELEASE_TAG")),
+            "content_directory_present": Path("/content").is_dir(),
+        }
+
+    def prepare_optional_backends(self):
+        """Remove only an unused incompatible TorchAO, with explicit Colab opt-in."""
+        names = ("torch", "peft", "transformers", "torchao")
+        before = {name: installed_version(name) for name in names}
+        if before["torchao"] is None:
+            self.emit("Optional TorchAO is absent; no compatibility cleanup needed.")
+            return
+        if before["peft"] != "0.21.2":
+            raise RuntimeError("Unexpected PEFT version; refusing automatic optional-backend changes")
+        incompatible = torchao_is_incompatible(before["torchao"])
+        if incompatible is False:
+            self.emit(f"Optional TorchAO {before['torchao']} meets PEFT 0.21.2's >=0.16.0 requirement; unchanged.")
+            return
+        evidence = self.colab_runtime_evidence()
+        reason = (f"Unused TorchAO {before['torchao']} is incompatible with pinned PEFT 0.21.2 "
+                  "(requires >=0.16.0 when TorchAO is installed). jex uses ordinary LoRA and bitsandbytes, not TorchAO.")
+        if incompatible is None:
+            reason = f"Cannot safely classify installed TorchAO {before['torchao']!r} against PEFT 0.21.2's >=0.16.0 requirement."
+        record = {"checked_at": utc(), "before": before, "reason": reason,
+                  "cleanup_explicitly_enabled": self.allow_colab_optional_package_cleanup,
+                  "runtime_evidence": evidence, "status": "blocked"}
+        path = self.root / "optional_backend_cleanup.json"
+        write_json(path, record)
+        self.emit("Optional-backend check: " + json.dumps(record, sort_keys=True))
+        remedy = ("No package was removed. Use a fresh isolated virtual environment without --system-site-packages "
+                  "and install the pinned dependencies there. In a hosted ephemeral Colab runtime only, "
+                  "review and enable --allow-colab-optional-package-cleanup.")
+        if incompatible is None:
+            raise RuntimeError(f"Cannot safely classify TorchAO version {before['torchao']!r}. " + remedy)
+        if not self.allow_colab_optional_package_cleanup or not all(evidence.values()):
+            raise RuntimeError(reason + " Automatic removal requires explicit opt-in and verified hosted Colab indicators. " + remedy)
+        self.emit(reason + " Removing only this unused optional package from the ephemeral Colab runtime.")
+        record["status"] = "removing"
+        write_json(path, record)
+        try:
+            self.command([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], cwd=self.root)
+            after = {name: installed_version(name) for name in names}
+            record["after"] = after
+            if after["torchao"] is not None or any(after[name] != before[name] for name in names[:-1]):
+                raise RuntimeError("Optional-backend cleanup verification failed; core package versions must remain unchanged")
+            record["status"] = "removed"
+        except BaseException as exc:
+            record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            write_json(path, record)
+        self.emit("Verified optional TorchAO removal; torch, PEFT and Transformers versions are unchanged.")
+
     def setup(self):
         self.clone(JEX_URL, JEX_COMMIT, self.repo)
         self.clone(HARNESS_URL, HARNESS_COMMIT, self.harness)
         self.command([sys.executable, "-m", "pip", "install", "-e", f"{self.repo}[server,dev,gpu]",
                       "-e", str(self.harness), *PINNED_EXTRA_PACKAGES[:2]], cwd=self.root)
+        self.prepare_optional_backends()
         (self.repo / "artifacts").mkdir(exist_ok=True)
         # The upstream harness ships published full-sample results. Preserve them
         # elsewhere, then score into an empty directory to avoid stale comparisons.
@@ -254,7 +336,7 @@ class Runner:
             "print('GPU',torch.cuda.get_device_name(0),'VRAM',torch.cuda.get_device_properties(0).total_memory,'bf16',torch.cuda.is_bf16_supported())"],
             cwd=self.root, stdout_file=self.root / "environment.txt")
         shutil.copy2(Path(__file__), self.root / "runner-source.py")
-        self.emit("LoRA retains upstream dtype/batch defaults. T4 uses fp32 and may run out of memory; no automatic sample/batch reduction.")
+        self.emit("LoRA retains upstream dtype/batch defaults. PyTorch may report emulated BF16 support on T4; memory use remains unverified. No automatic sample/batch reduction.")
 
     def download_baseline(self, label):
         model, filename = BASELINES[label]
@@ -448,12 +530,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/content/jex-full-run")
     parser.add_argument("--jev-license-ack", action="store_true", help="Enable Jev response download after license review. Does not waive license restrictions.")
+    parser.add_argument("--allow-colab-optional-package-cleanup", action="store_true",
+                        help="In a verified hosted Colab runtime only, remove unused TorchAO older than 0.16.0 if it conflicts with pinned PEFT")
     parser.add_argument("--plan-only", action="store_true", help="Print scope only; no cloning, installation, models, or experiments")
     args = parser.parse_args()
     if args.plan_only:
         print(json.dumps(CONFIG, indent=2))
         return 0
-    return Runner(args.root, jev_license_ack=args.jev_license_ack).run()
+    return Runner(args.root, jev_license_ack=args.jev_license_ack,
+                  allow_colab_optional_package_cleanup=args.allow_colab_optional_package_cleanup).run()
 
 
 if __name__ == "__main__":

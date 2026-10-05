@@ -6,7 +6,8 @@ Use [`notebooks/jex_gpu_full.ipynb`](../notebooks/jex_gpu_full.ipynb) for the or
 
 1. Upload `notebooks/jex_gpu_full.ipynb` to Colab and select a GPU runtime.
 2. Review the [released response-data license](https://github.com/AppliedMachineLearning-Lab/jev-benchmarking/blob/6bbdeb33474849b6de2f0cccc9f5e19756abd67e/responses/LICENSE_RESPONSES.md). `JEV_RESPONSE_LICENSE_ACK` defaults to `False`. Enable it only for a compliant intended use; it does not waive restrictions. With it disabled, Jev download/scoring/comparison are reported as blocked and independent work continues.
-3. Choose **Run all**. Keep the full output and download `results.zip` and `checkpoints.zip` before the runtime disappears.
+3. Review `COLAB_OPTIONAL_PACKAGE_CLEANUP` (enabled in this hosted-Colab notebook). It permits only removal of unused TorchAO older than 0.16.0 when it conflicts with pinned PEFT 0.21.2; it does not upgrade dependencies. Disable it if you do not want that cleanup.
+4. Choose **Run all**. Keep the full output and download `results.zip` and `checkpoints.zip` before the runtime disappears.
 
 No GitHub token, Drive mount, or paid model API is required. Gated datasets may remain unavailable and must be disclosed in the final coverage report. This runner does not accept dataset access terms or request credentials automatically.
 
@@ -41,11 +42,19 @@ This is the **full configured notebook run**, not evaluation on every example of
 
 ## Failure, recovery, and coverage
 
-Each subprocess retains stdout/stderr in its stage log and fails on a nonzero exit code. Failed dependencies block downstream stages; unrelated experiments continue. The runner exits nonzero if any declared stage failed or remains blocked. A successful subprocess does **not** prove complete dataset coverage: the upstream benchmark code can skip unavailable configurations or schema-rejected requests.
+Each subprocess retains stdout/stderr in its stage log and fails on a nonzero exit code. The notebook explicitly streams the runner's combined stdout/stderr pipe, because inherited subprocess output can be invisible in Colab. Failed dependencies block downstream stages; unrelated experiments continue. The runner exits nonzero if any declared stage failed or remains blocked. A successful subprocess does **not** prove complete dataset coverage: the upstream benchmark code can skip unavailable configurations or schema-rejected requests.
 
 Rerun in the same runtime and root directory to retry unsuccessful stages. Completed stages with nonempty expected outputs are retained, and extraction reuses the exact saved source records. A changed configuration is refused in an existing root; use a new root for a different experiment. Resume is same-runtime recovery, not a guarantee against deleted or modified artifacts. Training itself is not checkpointed mid-stage.
 
 The upstream harness contains published full-sample result JSON files. On first setup, those are preserved in `published-results-reference-only/`, outside the scoring directory. Fresh evaluations cannot silently inherit their scores. Per-model coverage files retain answered/example counts and skipped configurations; comparison metadata lists the common-task intersection and excluded tasks. Inspect these files and logs before reporting a mean or saying all 37 tasks completed.
+
+## Narrow optional-package cleanup
+
+A hosted Colab image was observed with TorchAO 0.10.0 preinstalled. PEFT 0.21.2 rejects an installed TorchAO older than 0.16.0 while setting up ordinary LoRA, even though this experiment does not use TorchAO. This is a dependency conflict, not a failed model result.
+
+Setup reads package metadata without importing ML packages. It leaves absent or compatible TorchAO unchanged. Removal requires both the explicit `--allow-colab-optional-package-cleanup` flag and all hosted-runtime indicators: the `google.colab` package, a nonempty `COLAB_RELEASE_TAG`, and an existing `/content` directory. The notebook passes the flag when its visible cleanup option is enabled. The only package it can remove is the unused incompatible TorchAO; it verifies that torch, PEFT and Transformers versions remain unchanged. Reason, runtime indicators, and before/after versions are saved in `optional_backend_cleanup.json` and the setup log. Unrecognized/prerelease version metadata is not automatically removed.
+
+Outside verified hosted Colab, or without opt-in, a conflict stops setup before any removal and recommends a fresh isolated virtual environment without `--system-site-packages`. For example, create a dedicated GPU environment and install the pinned requirements there rather than changing packages in an existing shared environment. Do not set Colab environment markers to bypass the guard. This cleanup adds no experimental stage, changes no training settings, and performs no broad dependency upgrades.
 
 ## Outputs
 
@@ -66,7 +75,7 @@ Archives omit source response SQLite databases, credentials, environment-variabl
 - The harness is pinned to `6bbdeb33474849b6de2f0cccc9f5e19756abd67e`.
 - Transformers 5.14.1 matches the harness's exact open-model requirement. PEFT 0.21.2 supplies the missing LoRA dependency; flash-linear-attention 0.5.2 is installed after the CPU tiny-model tests. Colab's CUDA PyTorch installation is retained subject to dependency requirements; resolved versions are recorded.
 - Python, NumPy and torch seeds are set. CUDA nondeterminism and unpinned upstream model/dataset Hub revisions still prevent a claim of bitwise reproducibility.
-- Original T4 LoRA uses float32 with batch four and no gradient checkpointing, so it may exhaust GPU memory. The runner never silently reduces model sizes, sample counts, batches, epochs or benchmark limits.
+- LoRA retains the original dtype selection, batch four and no gradient checkpointing. The code calls `torch.cuda.is_bf16_supported()`; recent PyTorch versions include emulated BF16 support by default, so T4 can select BF16 despite the original FP32 comment. The runner does not change model dtype logic. GPU memory exhaustion remains possible. The runner never silently reduces model sizes, sample counts, batches, epochs or benchmark limits.
 - The existing benchmark truncates state to 3,072 tokens; released baseline responses may have used longer state. Model comparisons must disclose this methodological difference.
 - Compatibility, resource requirements, scores, and execution time must be established by the actual Colab run. Orchestration tests are not GPU experiment results.
 
